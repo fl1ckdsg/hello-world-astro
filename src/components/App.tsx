@@ -134,10 +134,7 @@ export default function App() {
       )}
       {screen === 'game' && (
         <GameScreen
-          lang={lang}
-          nickname={userData.nickname}
-          character={userData.character}
-          settings={userData.settings}
+          userData={userData}
           onBack={() => setScreen('menu')}
         />
       )}
