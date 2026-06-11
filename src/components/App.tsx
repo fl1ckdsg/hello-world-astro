@@ -144,7 +144,7 @@ export default function App() {
       {screen === 'profile' && (
         <ProfileScreen
           userData={userData}
-          onSave={handleProfileSave}
+          onUpdate={updateAndSync}
           onBack={() => setScreen('menu')}
         />
       )}
