@@ -1,877 +1,859 @@
-import React, { useEffect, useRef, useCallback, useState } from 'react';
-import { t, type Language } from '../../lib/i18n';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { t } from '../../lib/i18n';
+import type { Language } from '../../lib/i18n';
+import type { UserData } from '../../lib/storage';
 import { hapticFeedback } from '../../lib/telegram';
-import type { CharacterCustomization, GameSettings } from '../../lib/storage';
+import { drawFighter } from '../game/FighterRenderer';
+import type { FighterState } from '../game/FighterRenderer';
+import type { CharacterCustomization } from '../../lib/storage';
 
 interface Props {
-  lang: Language;
-  nickname: string;
-  character: CharacterCustomization;
-  settings: GameSettings;
+  userData: UserData;
   onBack: () => void;
 }
 
-// ─── colour palettes ───────────────────────────────────────────────
-const SKIN_COLORS = ['#F4C28B', '#E8A96C', '#D4854A', '#B5622A', '#8B4010', '#5C2800'];
-const SHORTS_COLORS = ['#CC2200', '#0044CC', '#226622', '#664488', '#CC8800', '#222222'];
-const GLOVES_COLORS = ['#CC2200', '#0044CC', '#226622', '#FFD700', '#EE4488', '#222222'];
-const CROWD_COLORS = ['#CC2200', '#0044CC', '#226622', '#CC8800', '#884488', '#CC4400'];
-
-// ─── Types ─────────────────────────────────────────────────────────
-type FightState = 'idle' | 'jab' | 'hook' | 'uppercut' | 'kick' | 'block' | 'hit' | 'ko';
-type PhaseType = 'countdown' | 'fight' | 'roundEnd' | 'win' | 'lose' | 'ko';
-
 interface Fighter {
-  x: number;         // 0-100 position on ring
-  y: number;         // vertical offset (for hit stagger)
+  x: number;
+  y: number;
   hp: number;
   maxHp: number;
-  state: FightState;
+  state: FighterState;
   stateTimer: number;
   facing: 1 | -1;
+  isBlocking: boolean;
   comboCount: number;
-  comboTimer: number;
+  lastAttackTime: number;
 }
 
 interface Fan {
   x: number;
+  y: number;
   baseY: number;
-  w: number;
-  h: number;
   color: string;
   phase: number;
   speed: number;
   excitement: number;
 }
 
-interface GameState {
-  player: Fighter;
-  enemy: Fighter;
-  round: number;
-  roundTimer: number;   // frames remaining in round
-  phase: PhaseType;
-  phaseTimer: number;
-  combo: number;
-  fans: Fan[];
-  aiTimer: number;
-  flashTimer: number;   // combo flash
-}
+type GamePhase = 'countdown' | 'fight' | 'roundEnd' | 'gameOver';
 
-const ROUND_SECONDS = 60;
+const CANVAS_W = 360;
+const CANVAS_H = 480;
+const RING_FLOOR_Y = 320;
+const RING_LEFT = 20;
+const RING_RIGHT = 340;
+const FIGHTER_GROUND = RING_FLOOR_Y - 5;
+const ROUND_DURATION = 60;
 const TOTAL_ROUNDS = 3;
-const FPS = 60;
-const ROUND_FRAMES = ROUND_SECONDS * FPS;
-const HIT_RANGE = 22;     // position units
+const HIT_DISTANCE = 70;
+const ATTACK_DURATIONS: Record<string, number> = {
+  jab: 18,
+  hook: 28,
+  uppercut: 38,
+  kick: 32,
+};
+const ATTACK_DAMAGE: Record<string, number> = {
+  jab: 8,
+  hook: 15,
+  uppercut: 25,
+  kick: 18,
+};
+const ATTACK_HIT_FRAME: Record<string, number> = {
+  jab: 8,
+  hook: 14,
+  uppercut: 19,
+  kick: 16,
+};
 
-// ─── Drawing helpers ────────────────────────────────────────────────
-function drawBoxer(
-  ctx: CanvasRenderingContext2D,
-  cx: number,
-  baseY: number,
-  facing: 1 | -1,
-  state: FightState,
-  skin: string,
-  shortsCol: string,
-  glovesCol: string,
-  hairStyle: number,
-  bodyType: number,
-  tattoos: number,
-  scale: number,
-) {
-  const s = scale;
-  ctx.save();
-  ctx.translate(cx, baseY);
-  if (facing === -1) ctx.scale(-1, 1);
+const FAN_COLORS = ['#CC2200', '#002244', '#FFD700', '#006600', '#8B008B', '#FFA500', '#ffffff', '#ff6688'];
 
-  const bw = bodyType === 0 ? 10 : bodyType === 2 ? 15 : 12; // body width
-  const bx = -bw / 2;
+const ENEMY_CHAR: CharacterCustomization = {
+  skinColor: 2,
+  hairStyle: 0,
+  bodyType: 2,
+  tattoos: 1,
+  shortsColor: 1,
+  glovesColor: 1,
+};
 
-  // Punch offset
-  let punchX = 0;
-  let punchY = 0;
-  if (state === 'jab') { punchX = 8 * s; }
-  if (state === 'hook') { punchX = 6 * s; punchY = -2 * s; }
-  if (state === 'uppercut') { punchX = 2 * s; punchY = -8 * s; }
-  if (state === 'kick') { punchX = 10 * s; punchY = 4 * s; }
-
-  // Hit stagger
-  const hitX = state === 'hit' ? -4 * s : 0;
-
-  ctx.translate(hitX, 0);
-
-  // Legs
-  const legY = 18 * s;
-  ctx.fillStyle = skin;
-  if (state === 'kick') {
-    // kick leg extended
-    ctx.fillRect(-5 * s, legY, 5 * s, 14 * s);
-    ctx.fillRect(2 * s, legY, 5 * s, 10 * s);
-    ctx.fillRect(2 * s + punchX, legY + 4 * s, 10 * s, 5 * s);
-  } else {
-    ctx.fillRect(bx + 1 * s, legY, 5 * s, 14 * s);
-    ctx.fillRect(bx + 7 * s - (bw - 12) * s / 2, legY, 5 * s, 14 * s);
-  }
-
-  // Shoes
-  ctx.fillStyle = '#1a1a1a';
-  if (state === 'kick') {
-    ctx.fillRect(-5 * s, legY + 14 * s, 7 * s, 4 * s);
-    ctx.fillRect(2 * s + punchX, legY + 4 * s + 5 * s, 12 * s, 4 * s);
-  } else {
-    ctx.fillRect(bx, legY + 14 * s, 7 * s, 4 * s);
-    ctx.fillRect(bx + 5 * s - (bw - 12) * s / 2, legY + 14 * s, 8 * s, 4 * s);
-  }
-
-  // Shorts
-  ctx.fillStyle = shortsCol;
-  ctx.fillRect(bx * s, legY - 2 * s, bw * s, 8 * s);
-
-  // Belt stripe
-  ctx.fillStyle = '#FFD70088';
-  ctx.fillRect(bx * s, legY - 2 * s, bw * s, 2 * s);
-
-  // Body
-  ctx.fillStyle = '#CC4400'; // shirt base
-  ctx.fillRect(bx * s, 8 * s, bw * s, 12 * s);
-
-  // Tattoo on body
-  if (tattoos >= 2) {
-    ctx.fillStyle = '#00000055';
-    ctx.fillRect(bx * s + 2 * s, 9 * s, 3 * s, 8 * s);
-  }
-
-  // Left arm (back)
-  ctx.fillStyle = skin;
-  ctx.fillRect(bx * s - 4 * s, 8 * s, 4 * s, 9 * s);
-  // Left glove (back)
-  ctx.fillStyle = glovesCol;
-  ctx.fillRect(bx * s - 5 * s, 15 * s, 5 * s, 5 * s);
-
-  // Tattoo on arm
-  if (tattoos === 1 || tattoos === 3) {
-    ctx.fillStyle = '#00000066';
-    ctx.fillRect(bx * s - 3 * s, 10 * s, 2 * s, 5 * s);
-  }
-
-  // Right arm (front) with punch
-  ctx.fillStyle = skin;
-  ctx.fillRect((bx + bw) * s, 8 * s + punchY, 4 * s, 9 * s);
-  // Right glove (front) extended
-  ctx.fillStyle = glovesCol;
-  ctx.fillRect((bx + bw) * s + punchX, 14 * s + punchY, 5 * s, 5 * s);
-
-  // Neck
-  ctx.fillStyle = skin;
-  ctx.fillRect(-2 * s, 3 * s, 4 * s, 6 * s);
-
-  // Head
-  ctx.fillStyle = skin;
-  ctx.fillRect(-5 * s, -6 * s, 10 * s, 10 * s);
-
-  // Helmet/hair
-  if (hairStyle === 3) {
-    // bald - slight shine
-    ctx.fillStyle = skin;
-  } else if (hairStyle === 1) {
-    // mohawk
-    ctx.fillStyle = '#CC0000';
-    ctx.fillRect(-1 * s, -10 * s, 2 * s, 6 * s);
-  } else if (hairStyle === 2) {
-    // dreads
-    ctx.fillStyle = '#3a1a00';
-    for (let i = 0; i < 4; i++) {
-      ctx.fillRect((-4 + i * 2) * s, -8 * s, s, 10 * s);
-    }
-  } else if (hairStyle === 4) {
-    // afro
-    ctx.fillStyle = '#1a0a00';
-    ctx.beginPath();
-    ctx.arc(0, -8 * s, 7 * s, 0, Math.PI * 2);
-    ctx.fill();
-  } else {
-    // short
-    ctx.fillStyle = '#1a0a00';
-    ctx.fillRect(-5 * s, -6 * s, 10 * s, 4 * s);
-  }
-
-  // Eyes
-  ctx.fillStyle = '#000';
-  ctx.fillRect(-3 * s, -2 * s, 2 * s, 2 * s);
-  ctx.fillRect(1 * s, -2 * s, 2 * s, 2 * s);
-
-  // Mouth / expression
-  if (state === 'ko') {
-    ctx.fillStyle = '#FF000088';
-    ctx.fillRect(-3 * s, 1 * s, 6 * s, 2 * s);
-  } else if (state === 'hit') {
-    ctx.fillStyle = '#FFD700';
-    ctx.fillRect(-2 * s, 1 * s, 4 * s, 2 * s);
-  } else {
-    ctx.fillStyle = '#8B0000';
-    ctx.fillRect(-2 * s, 1 * s, 4 * s, s);
-  }
-
-  // Boxing gloves on face (block state)
-  if (state === 'block') {
-    ctx.fillStyle = glovesCol;
-    ctx.fillRect(-8 * s, -4 * s, 5 * s, 7 * s);
-    ctx.fillRect(3 * s, -4 * s, 5 * s, 7 * s);
-  }
-
-  ctx.restore();
-}
-
-function drawRing(ctx: CanvasRenderingContext2D, w: number, h: number, ringY: number) {
-  // Sky gradient
-  const grad = ctx.createLinearGradient(0, 0, 0, ringY);
-  grad.addColorStop(0, '#0a0520');
-  grad.addColorStop(1, '#1a0800');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, w, ringY);
-
-  // Ring floor (perspective trapezoid)
-  const floorH = h - ringY;
-  ctx.fillStyle = '#C8A040';
-  ctx.beginPath();
-  ctx.moveTo(w * 0.05, ringY);
-  ctx.lineTo(w * 0.95, ringY);
-  ctx.lineTo(w * 1.1, h);
-  ctx.lineTo(w * -0.1, h);
-  ctx.closePath();
-  ctx.fill();
-
-  // Floor lines
-  ctx.strokeStyle = '#A08030';
-  ctx.lineWidth = 1;
-  for (let i = 1; i < 5; i++) {
-    const y = ringY + floorH * (i / 5);
-    const pct = i / 5;
-    ctx.beginPath();
-    ctx.moveTo(w * (0.05 - pct * 0.15), y);
-    ctx.lineTo(w * (0.95 + pct * 0.15), y);
-    ctx.stroke();
-  }
-
-  // Center line
-  ctx.strokeStyle = '#88601888';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(w * 0.5, ringY);
-  ctx.lineTo(w * 0.5, h);
-  ctx.stroke();
-
-  // Ropes
-  const ropeColors = ['#CC2200', '#FFFFFF', '#CC2200'];
-  const ropeYs = [ringY - 60, ringY - 36, ringY - 16];
-  ropeYs.forEach((ry, i) => {
-    ctx.strokeStyle = ropeColors[i];
-    ctx.lineWidth = 4;
-    ctx.beginPath();
-    ctx.moveTo(10, ry);
-    ctx.lineTo(w - 10, ry);
-    ctx.stroke();
-  });
-
-  // Corner posts
-  const postX = [10, w - 10];
-  postX.forEach(px => {
-    ctx.fillStyle = '#FFD700';
-    ctx.fillRect(px - 5, ringY - 80, 10, 80);
-  });
-}
-
-function drawCrowd(ctx: CanvasRenderingContext2D, fans: Fan[], w: number, ringY: number) {
-  fans.forEach(fan => {
-    fan.phase += fan.speed * (1 + fan.excitement);
-    const jump = Math.abs(Math.sin(fan.phase)) * (8 + fan.excitement * 14);
-    const y = fan.baseY - jump;
-    ctx.fillStyle = fan.color;
-    ctx.fillRect(fan.x - fan.w / 2, y, fan.w, fan.h);
-    ctx.beginPath();
-    ctx.arc(fan.x, y - fan.w * 0.5, fan.w * 0.5, 0, Math.PI * 2);
-    ctx.fill();
-    // Arm raised when excited
-    if (fan.excitement > 0.3) {
-      ctx.fillRect(fan.x + fan.w / 2, y - fan.h * 0.3, 3, fan.h * 0.5);
-    }
-  });
-}
-
-function drawHpBar(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, hp: number, maxHp: number, flipped: boolean) {
-  const pct = Math.max(0, hp / maxHp);
-  ctx.fillStyle = '#0d0500';
-  ctx.fillRect(x, y, w, 16);
-
-  let barColor: string;
-  if (pct > 0.5) barColor = '#00CC44';
-  else if (pct > 0.25) barColor = '#FFD700';
-  else barColor = '#CC2200';
-
-  const fillW = w * pct;
-  ctx.fillStyle = barColor;
-  if (flipped) {
-    ctx.fillRect(x + w - fillW, y, fillW, 16);
-  } else {
-    ctx.fillRect(x, y, fillW, 16);
-  }
-
-  ctx.strokeStyle = '#FFD700';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(x, y, w, 16);
-}
-
-function makeInitialState(char: CharacterCustomization): GameState {
-  const fans: Fan[] = [];
-  for (let i = 0; i < 55; i++) {
-    fans.push({
-      x: 20 + Math.random() * 320,
-      baseY: 20 + Math.random() * 90,
-      w: 10 + Math.random() * 8,
-      h: 18 + Math.random() * 10,
-      color: CROWD_COLORS[Math.floor(Math.random() * CROWD_COLORS.length)] + 'CC',
-      phase: Math.random() * Math.PI * 2,
-      speed: 0.04 + Math.random() * 0.03,
-      excitement: 0.1,
-    });
-  }
-  return {
-    player: { x: 25, y: 0, hp: 100, maxHp: 100, state: 'idle', stateTimer: 0, facing: 1, comboCount: 0, comboTimer: 0 },
-    enemy: { x: 75, y: 0, hp: 100, maxHp: 100, state: 'idle', stateTimer: 0, facing: -1, comboCount: 0, comboTimer: 0 },
-    round: 1,
-    roundTimer: ROUND_FRAMES,
-    phase: 'countdown',
-    phaseTimer: 2 * FPS,
-    combo: 0,
-    fans,
-    aiTimer: 60,
-    flashTimer: 0,
-  };
-}
-
-export default function GameScreen({ lang, nickname, character, settings, onBack }: Props) {
+export default function GameScreen({ userData, onBack }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const stateRef = useRef<GameState | null>(null);
-  const rafRef = useRef<number>(0);
-  const pressedRef = useRef<Set<string>>(new Set());
-  const [uiPhase, setUiPhase] = useState<PhaseType>('countdown');
-  const [uiRound, setUiRound] = useState(1);
-  const [uiTime, setUiTime] = useState(ROUND_SECONDS);
-  const [uiCombo, setUiCombo] = useState(0);
+  const stateRef = useRef<{
+    player: Fighter;
+    enemy: Fighter;
+    fans: Fan[];
+    phase: GamePhase;
+    round: number;
+    timer: number;
+    frameCount: number;
+    countdownTimer: number;
+    playerRoundsWon: number;
+    enemyRoundsWon: number;
+    comboDisplay: number;
+    comboTimer: number;
+    hitEffects: { x: number; y: number; timer: number; text: string }[];
+    aiTimer: number;
+    playerMoveDir: number;
+    attackHit: Record<string, boolean>;
+  }>();
+  const animRef = useRef<number>(0);
+  const lastTimeRef = useRef<number>(0);
+  const [gameOverResult, setGameOverResult] = useState<'win' | 'lose' | null>(null);
+  const [displayPhase, setDisplayPhase] = useState<GamePhase>('countdown');
+  const [displayRound, setDisplayRound] = useState(1);
+  const [displayTimer, setDisplayTimer] = useState(ROUND_DURATION);
+  const lang = userData.language as Language;
 
-  const skin = SKIN_COLORS[character.skinColor] || SKIN_COLORS[0];
-  const shortsCol = SHORTS_COLORS[character.shortsColor] || SHORTS_COLORS[0];
-  const glovesCol = GLOVES_COLORS[character.glovesColor] || GLOVES_COLORS[1];
+  const createFighters = (): { player: Fighter; enemy: Fighter } => ({
+    player: {
+      x: 80,
+      y: 0,
+      hp: 100,
+      maxHp: 100,
+      state: 'idle',
+      stateTimer: 0,
+      facing: 1,
+      isBlocking: false,
+      comboCount: 0,
+      lastAttackTime: 0,
+    },
+    enemy: {
+      x: 280,
+      y: 0,
+      hp: 100,
+      maxHp: 100,
+      state: 'idle',
+      stateTimer: 0,
+      facing: -1,
+      isBlocking: false,
+      comboCount: 0,
+      lastAttackTime: 0,
+    },
+  });
 
-  const doPlayerAction = useCallback((action: string) => {
-    const gs = stateRef.current;
-    if (!gs || gs.phase !== 'fight') return;
-    const p = gs.player;
-    if (p.state !== 'idle' && p.state !== 'block') return;
-
-    if (action === 'block') {
-      p.state = 'block';
-      p.stateTimer = 0;
-      return;
+  const createFans = (): Fan[] => {
+    const fans: Fan[] = [];
+    for (let i = 0; i < 55; i++) {
+      const bY = 60 + Math.floor(i / 12) * 28 + Math.random() * 10;
+      fans.push({
+        x: 20 + Math.random() * 320,
+        y: bY,
+        baseY: bY,
+        color: FAN_COLORS[Math.floor(Math.random() * FAN_COLORS.length)],
+        phase: Math.random() * Math.PI * 2,
+        speed: 0.06 + Math.random() * 0.06,
+        excitement: 0.3,
+      });
     }
+    return fans;
+  };
 
-    const dist = Math.abs(p.x - gs.enemy.x);
-    if (dist > HIT_RANGE) return; // out of range
+  const initGame = useCallback(() => {
+    const { player, enemy } = createFighters();
+    stateRef.current = {
+      player,
+      enemy,
+      fans: createFans(),
+      phase: 'countdown',
+      round: 1,
+      timer: ROUND_DURATION,
+      frameCount: 0,
+      countdownTimer: 180,
+      playerRoundsWon: 0,
+      enemyRoundsWon: 0,
+      comboDisplay: 0,
+      comboTimer: 0,
+      hitEffects: [],
+      aiTimer: 60,
+      playerMoveDir: 0,
+      attackHit: {},
+    };
+    setDisplayPhase('countdown');
+    setDisplayRound(1);
+    setDisplayTimer(ROUND_DURATION);
+    setGameOverResult(null);
+  }, []);
 
-    let dmg = 0;
-    let newState: FightState = 'idle';
-    if (action === 'jab') { dmg = 8; newState = 'jab'; }
-    else if (action === 'hook') { dmg = 15; newState = 'hook'; }
-    else if (action === 'uppercut') { dmg = 25; newState = 'uppercut'; }
-    else if (action === 'kick') { dmg = 18; newState = 'kick'; }
+  const doAttack = useCallback((attackType: string) => {
+    const s = stateRef.current;
+    if (!s) return;
+    const f = s.player;
+    if (f.state !== 'idle' && f.state !== 'block') return;
+    if (s.phase !== 'fight') return;
+    f.state = attackType as FighterState;
+    f.stateTimer = ATTACK_DURATIONS[attackType] || 20;
+    s.attackHit[attackType + '_player'] = false;
+  }, []);
 
-    if (dmg === 0) return;
-    p.state = newState;
-    p.stateTimer = 0;
-
-    if (gs.enemy.state === 'block') {
-      dmg = Math.floor(dmg * 0.2);
-    }
-
-    gs.enemy.hp = Math.max(0, gs.enemy.hp - dmg);
-    gs.enemy.state = 'hit';
-    gs.enemy.stateTimer = 0;
-
-    gs.combo++;
-    gs.flashTimer = 30;
-    gs.fans.forEach(f => { f.excitement = Math.min(1, f.excitement + 0.3); });
-    hapticFeedback('medium');
-
-    if (gs.enemy.hp <= 0) {
-      gs.enemy.state = 'ko';
-      gs.phase = 'ko';
-      gs.phaseTimer = 3 * FPS;
-      gs.fans.forEach(f => { f.excitement = 1; });
+  const doBlock = useCallback((blocking: boolean) => {
+    const s = stateRef.current;
+    if (!s) return;
+    const f = s.player;
+    if (blocking) {
+      if (f.state === 'idle' || f.state === 'block') {
+        f.state = 'block';
+        f.isBlocking = true;
+      }
+    } else {
+      if (f.state === 'block') {
+        f.state = 'idle';
+        f.isBlocking = false;
+      }
     }
   }, []);
 
-  const startGame = useCallback(() => {
-    stateRef.current = makeInitialState(character);
-  }, [character]);
+  const setMoveDir = useCallback((dir: number) => {
+    const s = stateRef.current;
+    if (!s) return;
+    s.playerMoveDir = dir;
+  }, []);
 
   useEffect(() => {
-    startGame();
-  }, [startGame]);
+    initGame();
+  }, [initGame]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const resize = () => {
-      canvas.width = canvas.offsetWidth;
-      canvas.height = canvas.offsetHeight;
+    const drawBackground = (ctx: CanvasRenderingContext2D) => {
+      const sky = ctx.createLinearGradient(0, 0, 0, RING_FLOOR_Y - 60);
+      sky.addColorStop(0, '#0a0418');
+      sky.addColorStop(1, '#1a0a2e');
+      ctx.fillStyle = sky;
+      ctx.fillRect(0, 0, CANVAS_W, RING_FLOOR_Y - 60);
     };
-    resize();
-    window.addEventListener('resize', resize);
 
-    const loop = () => {
-      const gs = stateRef.current;
-      if (!gs) { rafRef.current = requestAnimationFrame(loop); return; }
-
-      const ctx = canvas.getContext('2d')!;
-      const W = canvas.width;
-      const H = canvas.height;
-      const ringY = H * 0.4;
-
-      ctx.clearRect(0, 0, W, H);
-      drawRing(ctx, W, H, ringY);
-      drawCrowd(ctx, gs.fans, W, ringY);
-
-      // Convert ring positions to screen coords
-      const toScreenX = (pos: number) => W * 0.05 + pos / 100 * W * 0.9;
-      const fighterScale = W / 100;
-
-      const playerScreenX = toScreenX(gs.player.x);
-      const enemyScreenX = toScreenX(gs.enemy.x);
-
-      // ── AI ──
-      if (gs.phase === 'fight') {
-        gs.aiTimer--;
-        const e = gs.enemy;
-        const p = gs.player;
-
-        if (gs.aiTimer <= 0) {
-          gs.aiTimer = 50 + Math.floor(Math.random() * 40);
-          if (e.state === 'idle') {
-            const dist = Math.abs(e.x - p.x);
-            const roll = Math.random();
-            if (dist > HIT_RANGE + 5) {
-              // Move toward player
-              e.x += e.facing === -1 ? -5 : 5;
-              e.x = Math.max(5, Math.min(95, e.x));
-            } else if (roll < 0.25) {
-              // AI jab
-              e.state = 'jab';
-              e.stateTimer = 0;
-              if (p.state !== 'block') {
-                const d = 6 + Math.floor(Math.random() * 6);
-                p.hp = Math.max(0, p.hp - d);
-                p.state = 'hit';
-                p.stateTimer = 0;
-                gs.fans.forEach(f => { f.excitement = Math.min(1, f.excitement + 0.1); });
-              }
-            } else if (roll < 0.4) {
-              e.state = 'hook';
-              e.stateTimer = 0;
-              if (p.state !== 'block') {
-                const d = 12 + Math.floor(Math.random() * 8);
-                p.hp = Math.max(0, p.hp - d);
-                p.state = 'hit';
-                p.stateTimer = 0;
-              }
-            } else if (roll < 0.5) {
-              e.state = 'block';
-              e.stateTimer = 0;
-            } else if (roll < 0.6) {
-              // Move back
-              e.x += 5;
-              e.x = Math.min(95, e.x);
-            }
-          }
-          if (p.hp <= 0) {
-            p.state = 'ko';
-            gs.phase = 'ko';
-            gs.phaseTimer = 3 * FPS;
-          }
-        }
-
-        // Player movement
-        const pressed = pressedRef.current;
-        if (pressed.has('left') && p.state === 'idle') {
-          p.x = Math.max(5, p.x - 1.2);
-        }
-        if (pressed.has('right') && p.state === 'idle') {
-          p.x = Math.min(90, p.x + 1.2);
-        }
-
-        // Update facing
-        p.facing = p.x < e.x ? 1 : -1;
-        e.facing = e.x < p.x ? 1 : -1;
-
-        // Round timer
-        gs.roundTimer--;
-        if (gs.roundTimer <= 0) {
-          if (gs.round < TOTAL_ROUNDS) {
-            gs.phase = 'roundEnd';
-            gs.phaseTimer = 2 * FPS;
-          } else {
-            // Decision
-            if (p.hp > e.hp) {
-              gs.phase = 'win';
-            } else {
-              gs.phase = 'lose';
-            }
-            gs.phaseTimer = 0;
-          }
-        }
-      }
-
-      // Phase transitions
-      if (gs.phaseTimer > 0) {
-        gs.phaseTimer--;
-        if (gs.phaseTimer === 0) {
-          if (gs.phase === 'countdown') {
-            gs.phase = 'fight';
-          } else if (gs.phase === 'roundEnd') {
-            gs.round++;
-            gs.roundTimer = ROUND_FRAMES;
-            gs.player.hp = gs.player.maxHp;
-            gs.enemy.hp = gs.enemy.maxHp;
-            gs.player.state = 'idle';
-            gs.enemy.state = 'idle';
-            gs.phase = 'countdown';
-            gs.phaseTimer = 2 * FPS;
-          } else if (gs.phase === 'ko') {
-            if (gs.player.hp <= 0) {
-              gs.phase = 'lose';
-            } else {
-              gs.phase = 'win';
-            }
-          }
-        }
-      }
-
-      // State timers
-      const updateFighter = (f: Fighter) => {
-        if (f.state !== 'idle' && f.state !== 'block' && f.state !== 'ko') {
-          f.stateTimer++;
-          const dur = f.state === 'uppercut' ? 25 : f.state === 'hook' ? 20 : 15;
-          if (f.stateTimer >= dur) {
-            f.state = 'idle';
-            f.stateTimer = 0;
-          }
-        }
-        if (f.state === 'block' && !pressedRef.current.has('block')) {
-          f.stateTimer++;
-          if (f.stateTimer > 3) { f.state = 'idle'; f.stateTimer = 0; }
-        }
-        f.comboTimer = Math.max(0, f.comboTimer - 1);
-      };
-      updateFighter(gs.player);
-      updateFighter(gs.enemy);
-
-      // Decay combo
-      if (gs.combo > 0) {
-        gs.player.comboTimer = 120;
-      }
-      if (gs.player.comboTimer <= 0) {
-        gs.combo = 0;
-      }
-      gs.flashTimer = Math.max(0, gs.flashTimer - 1);
-
-      // ── Draw fighters ──
-      const pY = ringY + (gs.player.state === 'hit' ? -4 : 0);
-      const eY = ringY + (gs.enemy.state === 'hit' ? -4 : 0);
-
-      drawBoxer(ctx, playerScreenX, pY, gs.player.facing, gs.player.state,
-        skin, shortsCol, glovesCol, character.hairStyle, character.bodyType, character.tattoos, fighterScale * 0.35);
-      // Enemy (fixed gray/steel appearance)
-      drawBoxer(ctx, enemyScreenX, eY, gs.enemy.facing, gs.enemy.state,
-        '#B0B0B0', '#002244', '#444444', 3, 2, 0, fighterScale * 0.35);
-
-      // Punch flash
-      if ((gs.player.state === 'jab' || gs.player.state === 'hook' || gs.player.state === 'uppercut') && gs.player.stateTimer < 8) {
-        ctx.fillStyle = '#FFFF0066';
+    const drawCrowd = (ctx: CanvasRenderingContext2D, fans: Fan[]) => {
+      fans.forEach(fan => {
+        fan.phase += fan.speed * (0.5 + fan.excitement);
+        const yOff = Math.abs(Math.sin(fan.phase)) * 10 * (0.5 + fan.excitement);
+        fan.y = fan.baseY - yOff;
+        fan.excitement = Math.max(0.2, fan.excitement * 0.995);
+        ctx.fillStyle = fan.color;
+        ctx.fillRect(fan.x - 5, fan.y - 14, 10, 14);
+        ctx.fillStyle = '#dda070';
         ctx.beginPath();
-        ctx.arc(enemyScreenX, ringY - 20, 18, 0, Math.PI * 2);
+        ctx.arc(fan.x, fan.y - 18, 5, 0, Math.PI * 2);
         ctx.fill();
-      }
+      });
+    };
 
-      // ── UI overlays ──
-      // HP bars
-      const barW = W * 0.36;
-      const barY = 12;
-      drawHpBar(ctx, 12, barY, barW, gs.player.hp, gs.player.maxHp, false);
-      drawHpBar(ctx, W - 12 - barW, barY, barW, gs.enemy.hp, gs.enemy.maxHp, true);
+    const drawRing = (ctx: CanvasRenderingContext2D) => {
+      ctx.fillStyle = '#4a2000';
+      ctx.fillRect(0, RING_FLOOR_Y - 60, CANVAS_W, 40);
 
-      // Names
+      ctx.fillStyle = '#F0D060';
+      ctx.beginPath();
+      ctx.moveTo(RING_LEFT - 10, RING_FLOOR_Y - 20);
+      ctx.lineTo(RING_RIGHT + 10, RING_FLOOR_Y - 20);
+      ctx.lineTo(RING_RIGHT + 30, RING_FLOOR_Y + 80);
+      ctx.lineTo(RING_LEFT - 30, RING_FLOOR_Y + 80);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.strokeStyle = '#c0a030';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(CANVAS_W / 2, RING_FLOOR_Y - 20);
+      ctx.lineTo(CANVAS_W / 2, RING_FLOOR_Y + 80);
+      ctx.stroke();
+
+      ctx.fillStyle = '#CC2200';
+      ctx.fillRect(RING_LEFT - 10, RING_FLOOR_Y - 62, CANVAS_W - RING_LEFT * 2 + 20, 6);
+
+      const postColor = '#8B4513';
+      const postW = 8;
+      const postH = 50;
+      [RING_LEFT - 10, RING_RIGHT + 2].forEach(px => {
+        ctx.fillStyle = postColor;
+        ctx.fillRect(px, RING_FLOOR_Y - 62 - postH, postW, postH + 6);
+        ctx.fillStyle = '#FFD700';
+        ctx.fillRect(px - 2, RING_FLOOR_Y - 62 - postH - 6, postW + 4, 8);
+      });
+
+      [0, 15, 30].forEach((offset, i) => {
+        ctx.strokeStyle = i === 1 ? '#CC2200' : '#FFD700';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(RING_LEFT - 6, RING_FLOOR_Y - 62 - offset);
+        ctx.lineTo(RING_RIGHT + 6, RING_FLOOR_Y - 62 - offset);
+        ctx.stroke();
+      });
+    };
+
+    const drawHUD = (ctx: CanvasRenderingContext2D, s: typeof stateRef.current) => {
+      if (!s) return;
+
+      ctx.fillStyle = 'rgba(0,0,0,0.7)';
+      ctx.fillRect(0, 0, CANVAS_W, 50);
+
+      const pHpPct = s.player.hp / s.player.maxHp;
+      ctx.fillStyle = '#333';
+      ctx.fillRect(10, 10, 130, 16);
+      const pGrad = ctx.createLinearGradient(10, 0, 140, 0);
+      pGrad.addColorStop(0, '#CC2200');
+      pGrad.addColorStop(0.5, '#FF6600');
+      pGrad.addColorStop(1, '#FFD700');
+      ctx.fillStyle = pGrad;
+      ctx.fillRect(10, 10, 130 * pHpPct, 16);
+      ctx.strokeStyle = '#8B4513';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(10, 10, 130, 16);
+
       ctx.fillStyle = '#FFD700';
-      ctx.font = `bold ${Math.floor(W * 0.032)}px 'Courier New', monospace`;
-      ctx.fillText(nickname.substring(0, 10).toUpperCase(), 12, barY + 32);
+      ctx.font = 'bold 10px Courier New';
+      ctx.textAlign = 'left';
+      ctx.fillText(userData.nickname.substring(0, 10) || 'PLAYER', 10, 44);
+
+      const eHpPct = s.enemy.hp / s.enemy.maxHp;
+      ctx.fillStyle = '#333';
+      ctx.fillRect(CANVAS_W - 140, 10, 130, 16);
+      const eGrad = ctx.createLinearGradient(CANVAS_W - 140, 0, CANVAS_W - 10, 0);
+      eGrad.addColorStop(0, '#FFD700');
+      eGrad.addColorStop(0.5, '#0066FF');
+      eGrad.addColorStop(1, '#002244');
+      ctx.fillStyle = eGrad;
+      ctx.fillRect(CANVAS_W - 140 + 130 * (1 - eHpPct), 10, 130 * eHpPct, 16);
+      ctx.strokeStyle = '#8B4513';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(CANVAS_W - 140, 10, 130, 16);
+
+      ctx.fillStyle = '#88aaff';
       ctx.textAlign = 'right';
-      ctx.fillText('ЖЕЛЕЗНЫЙ', W - 12, barY + 32);
-      ctx.textAlign = 'left';
+      ctx.fillText('CPU', CANVAS_W - 10, 44);
 
-      // Round / timer display
-      const secs = Math.ceil(gs.roundTimer / FPS);
       ctx.fillStyle = '#FFD700';
-      ctx.font = `bold ${Math.floor(W * 0.038)}px 'Courier New', monospace`;
+      ctx.font = 'bold 14px Courier New';
       ctx.textAlign = 'center';
-      ctx.fillText(`${t('round', lang)} ${gs.round}`, W / 2, barY + 16);
-      ctx.fillText(String(secs), W / 2, barY + 32);
-      ctx.textAlign = 'left';
+      ctx.fillText(`R${s.round}`, CANVAS_W / 2, 22);
+      ctx.font = 'bold 18px Courier New';
+      ctx.fillText(String(Math.ceil(s.timer)).padStart(2, '0'), CANVAS_W / 2, 44);
 
-      // Combo display
-      if (gs.combo >= 2 || gs.flashTimer > 0) {
-        ctx.font = `bold ${Math.floor(W * 0.05)}px 'Courier New', monospace`;
-        ctx.fillStyle = gs.flashTimer > 0 ? `rgba(255,${Math.floor(gs.flashTimer * 8)},0,1)` : '#FF8800';
-        ctx.textAlign = 'center';
-        ctx.fillText(`${gs.combo}x ${t('combo', lang)}!`, W / 2, ringY - 10);
-        ctx.textAlign = 'left';
-      }
-
-      // Phase overlays
-      if (gs.phase === 'countdown') {
-        ctx.fillStyle = '#00000088';
-        ctx.fillRect(0, 0, W, H);
+      if (s.comboDisplay >= 2 && s.comboTimer > 0) {
         ctx.fillStyle = '#FFD700';
-        ctx.font = `bold ${Math.floor(W * 0.12)}px 'Courier New', monospace`;
+        ctx.font = 'bold 20px Courier New';
         ctx.textAlign = 'center';
-        const cntSecs = Math.ceil(gs.phaseTimer / FPS);
-        ctx.fillText(cntSecs > 0 ? String(cntSecs) : t('fight', lang), W / 2, H * 0.5);
-        ctx.textAlign = 'left';
+        ctx.fillText(`${s.comboDisplay}x COMBO!`, CANVAS_W / 2, 80);
       }
-      if (gs.phase === 'roundEnd') {
-        ctx.fillStyle = '#00000088';
-        ctx.fillRect(0, 0, W, H);
+
+      s.hitEffects = s.hitEffects.filter(e => e.timer > 0);
+      s.hitEffects.forEach(e => {
+        e.timer--;
+        const alpha = e.timer / 30;
+        ctx.globalAlpha = alpha;
         ctx.fillStyle = '#FFD700';
-        ctx.font = `bold ${Math.floor(W * 0.07)}px 'Courier New', monospace`;
+        ctx.font = 'bold 16px Courier New';
         ctx.textAlign = 'center';
-        ctx.fillText(`${t('round', lang)} ${gs.round}`, W / 2, H * 0.5);
-        ctx.textAlign = 'left';
+        ctx.fillText(e.text, e.x, e.y - (30 - e.timer) * 0.5);
+        ctx.globalAlpha = 1;
+      });
+    };
+
+    const drawCountdown = (ctx: CanvasRenderingContext2D, timer: number, round: number) => {
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillRect(0, 100, CANVAS_W, 120);
+      ctx.fillStyle = '#FFD700';
+      ctx.font = 'bold 20px Courier New';
+      ctx.textAlign = 'center';
+      ctx.fillText(`ROUND ${round}`, CANVAS_W / 2, 140);
+
+      const countNum = Math.ceil(timer / 60);
+      ctx.font = 'bold 80px Courier New';
+      ctx.fillStyle = countNum <= 1 ? '#CC2200' : '#FFD700';
+      ctx.fillText(countNum > 0 ? String(countNum) : 'FIGHT!', CANVAS_W / 2, 200);
+    };
+
+    const drawRoundEnd = (ctx: CanvasRenderingContext2D, s: typeof stateRef.current) => {
+      if (!s) return;
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(0, 100, CANVAS_W, 120);
+      ctx.fillStyle = '#FFD700';
+      ctx.font = 'bold 32px Courier New';
+      ctx.textAlign = 'center';
+      const pWon = s.player.hp > s.enemy.hp;
+      ctx.fillText(pWon ? 'ROUND WIN!' : 'ROUND LOST', CANVAS_W / 2, 170);
+      ctx.font = 'bold 14px Courier New';
+      ctx.fillText(`Rounds: YOU ${s.playerRoundsWon} - ${s.enemyRoundsWon} CPU`, CANVAS_W / 2, 200);
+    };
+
+    const drawGameOver = (ctx: CanvasRenderingContext2D, result: 'win' | 'lose') => {
+      ctx.fillStyle = 'rgba(0,0,0,0.7)';
+      ctx.fillRect(0, 80, CANVAS_W, 200);
+      ctx.fillStyle = result === 'win' ? '#FFD700' : '#CC2200';
+      ctx.font = 'bold 36px Courier New';
+      ctx.textAlign = 'center';
+      ctx.fillText(result === 'win' ? 'YOU WIN!' : 'YOU LOSE!', CANVAS_W / 2, 160);
+      ctx.fillStyle = '#FFD700';
+      ctx.font = 'bold 14px Courier New';
+      ctx.fillText('Tap PLAY AGAIN to restart', CANVAS_W / 2, 200);
+    };
+
+    const updateAI = (s: typeof stateRef.current) => {
+      if (!s) return;
+      const ai = s.enemy;
+      const player = s.player;
+      if (s.phase !== 'fight') return;
+      if (ai.state !== 'idle') return;
+
+      s.aiTimer--;
+      if (s.aiTimer > 0) return;
+
+      const dist = Math.abs(ai.x - player.x);
+      const hpRatio = ai.hp / ai.maxHp;
+      const actions: Array<{ weight: number; action: () => void }> = [];
+
+      actions.push({
+        weight: dist > 80 ? 40 : 10,
+        action: () => {
+          const dir = player.x < ai.x ? -1 : 1;
+          ai.x = Math.max(RING_LEFT + 20, Math.min(RING_RIGHT - 20, ai.x + dir * 18));
+        }
+      });
+
+      if (dist < HIT_DISTANCE + 20) {
+        actions.push({ weight: 25, action: () => { ai.state = 'jab'; ai.stateTimer = ATTACK_DURATIONS.jab; s.attackHit['jab_enemy'] = false; } });
+        actions.push({ weight: 18, action: () => { ai.state = 'hook'; ai.stateTimer = ATTACK_DURATIONS.hook; s.attackHit['hook_enemy'] = false; } });
+        actions.push({ weight: 10, action: () => { ai.state = 'kick'; ai.stateTimer = ATTACK_DURATIONS.kick; s.attackHit['kick_enemy'] = false; } });
+        if (hpRatio < 0.5) {
+          actions.push({ weight: 20, action: () => { ai.state = 'block'; ai.stateTimer = 45; ai.isBlocking = true; } });
+        }
       }
 
-      // Update UI state
-      setUiPhase(gs.phase);
-      setUiRound(gs.round);
-      setUiTime(Math.ceil(gs.roundTimer / FPS));
-      setUiCombo(gs.combo);
-
-      // Excitement decay
-      gs.fans.forEach(f => { f.excitement = Math.max(0, f.excitement - 0.003); });
-
-      rafRef.current = requestAnimationFrame(loop);
-    };
-    rafRef.current = requestAnimationFrame(loop);
-
-    return () => {
-      cancelAnimationFrame(rafRef.current);
-      window.removeEventListener('resize', resize);
-    };
-  }, [lang, nickname, character, skin, shortsCol, glovesCol]);
-
-  const handleRelease = useCallback((action: string) => {
-    pressedRef.current.delete(action);
-    if (action === 'block') {
-      const p = stateRef.current?.player;
-      if (p?.state === 'block') {
-        p.state = 'idle';
-        p.stateTimer = 0;
+      if (hpRatio < 0.3) {
+        actions.push({ weight: 30, action: () => { ai.state = 'block'; ai.stateTimer = 60; ai.isBlocking = true; } });
       }
-    }
-  }, []);
 
-  const btnProps = (action: string) => ({
-    onPointerDown: (e: React.PointerEvent) => {
-      e.currentTarget.setPointerCapture(e.pointerId);
-      if (action === 'left' || action === 'right') {
-        pressedRef.current.add(action);
+      const total = actions.reduce((sum, a) => sum + a.weight, 0);
+      let rng = Math.random() * total;
+      for (const a of actions) {
+        rng -= a.weight;
+        if (rng <= 0) {
+          a.action();
+          break;
+        }
+      }
+
+      s.aiTimer = 30 + Math.floor(Math.random() * 30);
+    };
+
+    const updateFighter = (f: Fighter, isPlayer: boolean, s: typeof stateRef.current) => {
+      if (!s) return;
+
+      if (f.stateTimer > 0) {
+        f.stateTimer--;
+        if (f.stateTimer === 0) {
+          if (f.state !== 'ko') {
+            f.state = 'idle';
+            f.isBlocking = false;
+          }
+        }
+      }
+
+      if (isPlayer && s.phase === 'fight') {
+        if (f.state === 'idle' || f.state === 'block') {
+          const moveSpeed = 3;
+          if (s.playerMoveDir !== 0) {
+            f.x = Math.max(RING_LEFT + 20, Math.min(RING_RIGHT - 20, f.x + s.playerMoveDir * moveSpeed));
+          }
+        }
+      }
+
+      if (isPlayer) {
+        f.facing = f.x < s.enemy.x ? 1 : -1;
       } else {
-        doPlayerAction(action);
+        f.facing = f.x > s.player.x ? -1 : 1;
       }
-    },
-    onPointerUp: () => handleRelease(action),
-    onPointerLeave: () => handleRelease(action),
+
+      if (f.comboCount > 0) {
+        f.lastAttackTime++;
+        if (f.lastAttackTime > 120) {
+          f.comboCount = 0;
+          f.lastAttackTime = 0;
+        }
+      }
+    };
+
+    const checkHits = (attacker: Fighter, defender: Fighter, isPlayerAttacking: boolean, s: typeof stateRef.current) => {
+      if (!s) return;
+      const atkType = attacker.state;
+      if (!['jab', 'hook', 'uppercut', 'kick'].includes(atkType)) return;
+
+      const hitKey = `${atkType}_${isPlayerAttacking ? 'player' : 'enemy'}`;
+      if (s.attackHit[hitKey]) return;
+
+      const hitFrame = ATTACK_HIT_FRAME[atkType] || 10;
+      const framesIntoAttack = (ATTACK_DURATIONS[atkType] || 20) - attacker.stateTimer;
+      if (framesIntoAttack < hitFrame - 2 || framesIntoAttack > hitFrame + 4) return;
+
+      const dist = Math.abs(attacker.x - defender.x);
+      if (dist > HIT_DISTANCE) return;
+
+      s.attackHit[hitKey] = true;
+
+      if (defender.isBlocking) {
+        const blockedDmg = Math.floor((ATTACK_DAMAGE[atkType] || 10) * 0.15);
+        defender.hp = Math.max(0, defender.hp - blockedDmg);
+        s.hitEffects.push({ x: defender.x, y: FIGHTER_GROUND - 80, timer: 30, text: 'BLOCK!' });
+        return;
+      }
+
+      const dmg = ATTACK_DAMAGE[atkType] || 10;
+      defender.hp = Math.max(0, defender.hp - dmg);
+
+      attacker.comboCount++;
+      attacker.lastAttackTime = 0;
+      if (isPlayerAttacking) {
+        s.comboDisplay = attacker.comboCount;
+        s.comboTimer = 90;
+      }
+
+      const hitTexts: Record<string, string> = {
+        jab: 'JAB!', hook: 'HOOK!', uppercut: 'UPPER!', kick: 'KICK!'
+      };
+      s.hitEffects.push({
+        x: defender.x,
+        y: FIGHTER_GROUND - 100,
+        timer: 30,
+        text: hitTexts[atkType] || 'HIT!'
+      });
+
+      s.fans.forEach(fan => {
+        fan.excitement = Math.min(1, fan.excitement + 0.3);
+      });
+
+      if (isPlayerAttacking) {
+        hapticFeedback('medium');
+      }
+
+      if (defender.hp <= 0) {
+        defender.state = 'ko';
+        defender.stateTimer = 999;
+      } else {
+        defender.state = 'hit';
+        defender.stateTimer = 12;
+      }
+    };
+
+    const gameLoop = (timestamp: number) => {
+      const dt = timestamp - lastTimeRef.current;
+      lastTimeRef.current = timestamp;
+      if (dt > 200) {
+        animRef.current = requestAnimationFrame(gameLoop);
+        return;
+      }
+
+      const s = stateRef.current;
+      if (!s) {
+        animRef.current = requestAnimationFrame(gameLoop);
+        return;
+      }
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      s.frameCount++;
+
+      if (s.phase === 'countdown') {
+        s.countdownTimer--;
+        if (s.countdownTimer <= 0) {
+          s.phase = 'fight';
+          s.countdownTimer = 180;
+          setDisplayPhase('fight');
+        }
+      } else if (s.phase === 'fight') {
+        s.timer -= 1 / 60;
+        setDisplayTimer(Math.ceil(s.timer));
+
+        updateFighter(s.player, true, s);
+        updateFighter(s.enemy, false, s);
+        updateAI(s);
+
+        if (s.player.state !== 'idle' && s.player.state !== 'block' && s.player.state !== 'hit' && s.player.state !== 'ko') {
+          checkHits(s.player, s.enemy, true, s);
+        }
+        if (s.enemy.state !== 'idle' && s.enemy.state !== 'block' && s.enemy.state !== 'hit' && s.enemy.state !== 'ko') {
+          checkHits(s.enemy, s.player, false, s);
+        }
+
+        if (s.comboTimer > 0) s.comboTimer--;
+
+        if (s.player.hp <= 0 || s.enemy.hp <= 0 || s.timer <= 0) {
+          s.phase = 'roundEnd';
+          s.countdownTimer = 150;
+          const pWon = s.player.hp > s.enemy.hp || s.enemy.hp <= 0;
+          if (pWon) s.playerRoundsWon++; else s.enemyRoundsWon++;
+          setDisplayPhase('roundEnd');
+        }
+      } else if (s.phase === 'roundEnd') {
+        s.countdownTimer--;
+        if (s.countdownTimer <= 0) {
+          if (s.round >= TOTAL_ROUNDS || s.playerRoundsWon > 1 || s.enemyRoundsWon > 1) {
+            s.phase = 'gameOver';
+            const result = s.playerRoundsWon >= s.enemyRoundsWon ? 'win' : 'lose';
+            setGameOverResult(result);
+            setDisplayPhase('gameOver');
+          } else {
+            s.round++;
+            const { player, enemy } = createFighters();
+            s.player = player;
+            s.enemy = enemy;
+            s.phase = 'countdown';
+            s.countdownTimer = 180;
+            s.timer = ROUND_DURATION;
+            s.attackHit = {};
+            s.hitEffects = [];
+            setDisplayRound(s.round);
+            setDisplayTimer(ROUND_DURATION);
+            setDisplayPhase('countdown');
+          }
+        }
+      }
+
+      // === DRAW ===
+      ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+
+      drawBackground(ctx);
+      drawCrowd(ctx, s.fans);
+      drawRing(ctx);
+
+      drawFighter(ctx, s.player.x, FIGHTER_GROUND, s.player.facing, s.player.state, userData.character, false);
+      drawFighter(ctx, s.enemy.x, FIGHTER_GROUND, s.enemy.facing, s.enemy.state, ENEMY_CHAR, true);
+
+      drawHUD(ctx, s);
+
+      if (s.phase === 'countdown') {
+        drawCountdown(ctx, s.countdownTimer, s.round);
+      } else if (s.phase === 'roundEnd') {
+        drawRoundEnd(ctx, s);
+      } else if (s.phase === 'gameOver') {
+        const res = s.playerRoundsWon >= s.enemyRoundsWon ? 'win' : 'lose';
+        drawGameOver(ctx, res);
+      }
+
+      animRef.current = requestAnimationFrame(gameLoop);
+    };
+
+    animRef.current = requestAnimationFrame(gameLoop);
+    return () => {
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+    };
+  }, [userData]);
+
+  // suppress unused display state warnings
+  void displayPhase;
+  void displayRound;
+  void displayTimer;
+
+  const isLeftHand = userData.settings.controlLayout === 'left';
+
+  const dpadBtnStyle: React.CSSProperties = {
+    background: '#3d1a00',
+    border: '2px solid #8B4513',
+    color: '#FFD700',
+    fontFamily: 'Courier New, monospace',
+    fontSize: '18px',
+    fontWeight: 'bold',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: '4px',
+    touchAction: 'none',
+    userSelect: 'none',
+  };
+
+  const attackBtnStyle = (color: string): React.CSSProperties => ({
+    width: '58px',
+    height: '58px',
+    background: color,
+    border: '3px solid #FFD700',
+    color: '#FFD700',
+    fontFamily: 'Courier New, monospace',
+    fontSize: '11px',
+    fontWeight: 'bold',
+    letterSpacing: '1px',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: '4px',
+    boxShadow: '3px 3px 0 #000',
+    touchAction: 'none',
+    userSelect: 'none',
+    flexShrink: 0,
   });
 
-  const dpadLeft = settings.controlLayout === 'right';
-  const btnColors: Record<string, string> = {
-    jab: '#CC2200',
-    hook: '#0044CC',
-    uppercut: '#226622',
-    kick: '#664488',
-    block: '#8B4513',
-  };
-  const btnLabels: Record<string, string> = {
-    jab: t('jab', lang),
-    hook: t('hook', lang),
-    uppercut: t('uppercut', lang),
-    kick: t('kick', lang),
-    block: t('block', lang),
+  const blockBtnStyle: React.CSSProperties = {
+    width: '80px',
+    height: '40px',
+    background: '#004488',
+    border: '3px solid #88aaff',
+    color: '#88aaff',
+    fontFamily: 'Courier New, monospace',
+    fontSize: '13px',
+    fontWeight: 'bold',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: '4px',
+    touchAction: 'none',
+    userSelect: 'none',
+    flexShrink: 0,
   };
 
-  const endPhase = uiPhase === 'win' || uiPhase === 'lose';
+  const DPad = () => (
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: '44px 44px 44px',
+      gridTemplateRows: '44px 44px 44px',
+      gap: '2px',
+    }}>
+      <div />
+      <button style={dpadBtnStyle}>▲</button>
+      <div />
+      <button
+        style={dpadBtnStyle}
+        onPointerDown={() => setMoveDir(-1)}
+        onPointerUp={() => setMoveDir(0)}
+        onPointerLeave={() => setMoveDir(0)}
+      >◄</button>
+      <div style={{
+        background: '#3d1a00',
+        border: '2px solid #8B4513',
+        borderRadius: '4px',
+      }}/>
+      <button
+        style={dpadBtnStyle}
+        onPointerDown={() => setMoveDir(1)}
+        onPointerUp={() => setMoveDir(0)}
+        onPointerLeave={() => setMoveDir(0)}
+      >►</button>
+      <div />
+      <div />
+      <div />
+    </div>
+  );
+
+  const AttackButtons = () => (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', alignItems: 'center' }}>
+      <div style={{ display: 'flex', gap: '4px' }}>
+        <button style={attackBtnStyle('#880000')} onPointerDown={() => doAttack('jab')}>
+          {t('jab', lang)}
+        </button>
+        <button style={attackBtnStyle('#884400')} onPointerDown={() => doAttack('hook')}>
+          {t('hook', lang)}
+        </button>
+      </div>
+      <div style={{ display: 'flex', gap: '4px' }}>
+        <button style={attackBtnStyle('#006633')} onPointerDown={() => doAttack('uppercut')}>
+          {t('uppercut', lang)}
+        </button>
+        <button style={attackBtnStyle('#440088')} onPointerDown={() => doAttack('kick')}>
+          {t('kick', lang)}
+        </button>
+      </div>
+      <button
+        style={blockBtnStyle}
+        onPointerDown={() => doBlock(true)}
+        onPointerUp={() => doBlock(false)}
+        onPointerLeave={() => doBlock(false)}
+      >
+        🛡️ {t('block', lang)}
+      </button>
+    </div>
+  );
 
   return (
-    <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', background: '#0a0520', position: 'relative' }}>
-      {/* Game canvas */}
-      <canvas
-        ref={canvasRef}
-        style={{ flex: 1, width: '100%', display: 'block', touchAction: 'none' }}
-      />
-
-      {/* Win/Lose overlay */}
-      {endPhase && (
-        <div style={{
-          position: 'absolute',
-          inset: 0,
-          background: '#000000CC',
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          justifyContent: 'center',
-          gap: 20,
-          zIndex: 10,
-        }}>
-          <div style={{ fontSize: 64 }}>{uiPhase === 'win' ? '🏆' : '💀'}</div>
-          <div style={{
-            color: uiPhase === 'win' ? '#FFD700' : '#CC2200',
-            fontSize: 28,
-            letterSpacing: 4,
-            textShadow: '2px 2px 0 #000',
-          }}>
-            {t(uiPhase === 'win' ? 'you_win' : 'you_lose', lang)}
-          </div>
-          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', justifyContent: 'center', padding: '0 24px' }}>
-            <button className="pixel-btn" style={{ minWidth: 140 }} onClick={() => {
-              stateRef.current = makeInitialState(character);
-            }}>
-              🔁 {t('play_again', lang)}
-            </button>
-            <button className="pixel-btn" style={{ minWidth: 140, background: '#2a1005' }} onClick={onBack}>
-              ← {t('back', lang)}
-            </button>
-          </div>
-        </div>
-      )}
+    <div style={{
+      width: '100%',
+      height: '100%',
+      display: 'flex',
+      flexDirection: 'column',
+      background: '#1a0a00',
+      overflow: 'hidden',
+    }}>
+      {/* Game Canvas */}
+      <div style={{ position: 'relative', flex: '0 0 auto' }}>
+        <canvas
+          ref={canvasRef}
+          width={CANVAS_W}
+          height={CANVAS_H}
+          style={{
+            width: '100%',
+            imageRendering: 'pixelated',
+            display: 'block',
+          }}
+        />
+        <button
+          onClick={onBack}
+          style={{
+            position: 'absolute',
+            top: '4px',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            background: 'transparent',
+            border: 'none',
+            color: 'transparent',
+            width: '60px',
+            height: '20px',
+            cursor: 'pointer',
+            zIndex: 10,
+          }}
+        />
+      </div>
 
       {/* Controls */}
-      {!endPhase && (
+      <div style={{
+        flex: 1,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: '8px 16px',
+        background: '#0d0500',
+        borderTop: '2px solid #8B4513',
+        minHeight: '160px',
+      }}>
+        {isLeftHand ? (
+          <>
+            <AttackButtons />
+            <DPad />
+          </>
+        ) : (
+          <>
+            <DPad />
+            <AttackButtons />
+          </>
+        )}
+      </div>
+
+      {/* Game Over overlay buttons */}
+      {gameOverResult && (
         <div style={{
-          height: 200,
-          background: '#0d0500',
-          borderTop: '3px solid #8B4513',
+          position: 'absolute',
+          bottom: '200px',
+          left: '50%',
+          transform: 'translateX(-50%)',
           display: 'flex',
-          flexDirection: dpadLeft ? 'row' : 'row-reverse',
-          alignItems: 'center',
-          padding: '8px 12px',
-          gap: 12,
-          flexShrink: 0,
-          touchAction: 'none',
+          gap: '10px',
+          zIndex: 20,
         }}>
-          {/* D-Pad */}
-          <div style={{
-            display: 'grid',
-            gridTemplateColumns: '54px 54px 54px',
-            gridTemplateRows: '54px 54px 54px',
-            gap: 3,
-          }}>
-            {/* Row 1: empty, up, empty */}
-            <div />
-            <DpadBtn label="▲" action="up" {...btnProps('up')} />
-            <div />
-            {/* Row 2: left, center, right */}
-            <DpadBtn label="◄" action="left" {...btnProps('left')} />
-            <div style={{ background: '#1a0800', borderRadius: 4 }} />
-            <DpadBtn label="►" action="right" {...btnProps('right')} />
-            {/* Row 3: empty, down, empty */}
-            <div />
-            <DpadBtn label="▼" action="down" {...btnProps('down')} />
-            <div />
-          </div>
-
-          {/* Action buttons */}
-          <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 1fr', gridTemplateRows: '1fr 1fr', gap: 6, height: 164 }}>
-            {(['jab', 'hook', 'uppercut', 'kick'] as const).map(a => (
-              <ActionBtn key={a} label={btnLabels[a]} color={btnColors[a]} {...btnProps(a)} />
-            ))}
-          </div>
-
-          {/* Block button */}
-          <div style={{ display: 'flex', alignItems: 'center' }}>
-            <button
-              style={{
-                width: 54,
-                height: 120,
-                background: btnColors.block,
-                color: '#FFD700',
-                border: '2px solid #FFD700',
-                fontSize: 12,
-                letterSpacing: 1,
-                fontFamily: "'Courier New', monospace",
-                fontWeight: 'bold',
-                cursor: 'pointer',
-                touchAction: 'none',
-                borderRadius: 4,
-              }}
-              {...btnProps('block')}
-            >
-              {btnLabels.block}
-            </button>
-          </div>
+          <button
+            className="pixel-btn"
+            onClick={initGame}
+            style={{ minWidth: '120px' }}
+          >
+            🔄 {t('play_again', lang)}
+          </button>
+          <button
+            className="pixel-btn"
+            onClick={onBack}
+            style={{ minWidth: '100px', background: '#3d1a00' }}
+          >
+            ← {t('back', lang)}
+          </button>
         </div>
       )}
     </div>
-  );
-}
-
-function DpadBtn({ label, action, ...props }: { label: string; action: string } & Record<string, unknown>) {
-  return (
-    <button
-      style={{
-        background: '#2a1005',
-        color: '#FFD700',
-        border: '2px solid #8B4513',
-        fontSize: 18,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        cursor: 'pointer',
-        fontFamily: 'monospace',
-        touchAction: 'none',
-        borderRadius: 4,
-        WebkitTapHighlightColor: 'transparent',
-      }}
-      {...(props as React.ButtonHTMLAttributes<HTMLButtonElement>)}
-    >
-      {label}
-    </button>
-  );
-}
-
-function ActionBtn({ label, color, ...props }: { label: string; color: string } & Record<string, unknown>) {
-  return (
-    <button
-      style={{
-        background: color,
-        color: '#FFD700',
-        border: '2px solid #FFD70088',
-        fontSize: 13,
-        letterSpacing: 1,
-        fontFamily: "'Courier New', monospace",
-        fontWeight: 'bold',
-        cursor: 'pointer',
-        touchAction: 'none',
-        borderRadius: 4,
-        WebkitTapHighlightColor: 'transparent',
-      }}
-      {...(props as React.ButtonHTMLAttributes<HTMLButtonElement>)}
-    >
-      {label}
-    </button>
   );
 }
