@@ -6,16 +6,18 @@ import "../styles/global.css";
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link
-      rel="icon"
-      type="image/svg+xml"
-      href={`${(import.meta.env.BASE_URL || "/").replace(/\/$/, "")}/astro.svg`}
-    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="icon" type="image/svg+xml" href="/astro.svg" />
     <meta name="generator" content={Astro.generator} />
-    <title>Webflow Cloud Astro App</title>
+    <title>BoxFight</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
   </head>
   <body>
-    <slot />
+    <div id="app">
+      <slot />
+    </div>
   </body>
 </html>
